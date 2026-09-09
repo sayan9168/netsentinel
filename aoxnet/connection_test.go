@@ -48,16 +48,14 @@ func TestWindowUpdateAndGoAway(t *testing.T) {
 	clientNet, serverNet := net.Pipe()
 	client := NewConn(clientNet, DefaultMaxPayload)
 	server := NewConn(serverNet, DefaultMaxPayload)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
 	defer client.Close()
 	defer server.Close()
 
 	if err := client.HandshakeClient(ClientConfig{Name: "test-client"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.HandshakeServer("test-server"); err != nil {
-		t.Fatal(err)
-	}
-
 	stream, err := client.OpenStream()
 	if err != nil {
 		t.Fatal(err)
@@ -71,4 +69,7 @@ func TestWindowUpdateAndGoAway(t *testing.T) {
 	if _, err := client.OpenStream(); err == nil {
 		t.Fatal("expected new stream creation to fail after GOAWAY")
 	}
+	_ = client.Close()
+	_ = server.Close()
+	<-done
 }
