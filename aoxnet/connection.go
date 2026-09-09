@@ -2,6 +2,7 @@ package aoxnet
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,8 +13,17 @@ import (
 	"time"
 )
 
-type Hello struct { Name string `json:"name"`; Version byte `json:"version"`; Features []string `json:"features"` }
-type Welcome struct { Name string `json:"name"`; Version byte `json:"version"`; Features []string `json:"features"` }
+type Hello struct {
+	Name string `json:"name"`
+	Version byte `json:"version"`
+	Features []string `json:"features"`
+}
+
+type Welcome struct {
+	Name string `json:"name"`
+	Version byte `json:"version"`
+	Features []string `json:"features"`
+}
 
 type ServerConfig struct {
 	MaxPayload uint32
@@ -21,6 +31,7 @@ type ServerConfig struct {
 	Name string
 	Limits Limits
 }
+
 type ClientConfig struct {
 	MaxPayload uint32
 	ReadTimeout, WriteTimeout time.Duration
@@ -38,6 +49,10 @@ type Conn struct {
 	writeMu sync.Mutex
 	nextRequest uint64
 	ReadTimeout, WriteTimeout time.Duration
+	streams *StreamManager
+	stateMu sync.RWMutex
+	closed bool
+	goAway bool
 }
 
 func NewConn(c net.Conn, maxPayload uint32) *Conn {
@@ -47,13 +62,15 @@ func NewConn(c net.Conn, maxPayload uint32) *Conn {
 
 func newConnWithLimits(c net.Conn, limits Limits) *Conn {
 	limits = limits.normalize()
-	return &Conn{Conn: c, r: bufio.NewReader(c), maxPayload: limits.MaxPayload, limits: limits, rate: newRateLimiter(limits.MaxFrameRate, limits.RateWindow)}
+	return &Conn{Conn: c, r: bufio.NewReader(c), maxPayload: limits.MaxPayload, limits: limits, rate: newRateLimiter(limits.MaxFrameRate, limits.RateWindow), streams: NewStreamManager(limits.InitialWindow)}
 }
 
 func (c *Conn) send(f Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.WriteTimeout > 0 { _ = c.SetWriteDeadline(time.Now().Add(c.WriteTimeout)) }
+	if c.WriteTimeout > 0 {
+		_ = c.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	}
 	return f.Encode(c.Conn, c.maxPayload)
 }
 
@@ -76,7 +93,7 @@ func (c *Conn) sendError(code ErrorCode, message string, requestID uint64) error
 func (c *Conn) HandshakeClient(cfg ClientConfig) error {
 	if c.limits.HandshakeTimeout > 0 { _ = c.SetDeadline(time.Now().Add(c.limits.HandshakeTimeout)) }
 	defer c.SetDeadline(time.Time{})
-	hello, err := json.Marshal(Hello{Name: cfg.Name, Version: Version, Features: []string{"request-id", "crc32", "ping", "tls-transport"}})
+	hello, err := json.Marshal(Hello{Name: cfg.Name, Version: Version, Features: []string{"request-id", "crc32", "ping", "tls-transport", "multiplexing", "flow-control", "goaway"}})
 	if err != nil { return err }
 	id := c.nextID()
 	if err := c.send(Frame{Type: TypeHello, RequestID: id, Payload: hello}); err != nil { return err }
@@ -108,7 +125,7 @@ func (c *Conn) HandshakeServer(name string) error {
 		_ = c.sendError(ErrUnsupportedVersion, fmt.Sprintf("unsupported client version %d", h.Version), f.RequestID)
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, h.Version)
 	}
-	payload, err := json.Marshal(Welcome{Name: name, Version: Version, Features: []string{"request-id", "crc32", "ping", "tls-transport"}})
+	payload, err := json.Marshal(Welcome{Name: name, Version: Version, Features: []string{"request-id", "crc32", "ping", "tls-transport", "multiplexing", "flow-control", "goaway"}})
 	if err != nil { return err }
 	return c.send(Frame{Type: TypeWelcome, RequestID: f.RequestID, Payload: payload})
 }
@@ -120,15 +137,106 @@ func decodeProtocolError(payload []byte) error {
 	return pe
 }
 
+func (c *Conn) OpenStream() (*Stream, error) {
+	c.stateMu.RLock()
+	closed, shuttingDown := c.closed, c.goAway
+	c.stateMu.RUnlock()
+	if closed || shuttingDown { return nil, errors.New("connection is shutting down") }
+	return c.streams.OpenLocal()
+}
+
 func (c *Conn) Send(streamID uint32, payload []byte) (uint64, error) {
+	if streamID == 0 { return 0, errors.New("stream ID zero is reserved for connection control") }
+	if len(payload) > int(c.maxPayload) { return 0, fmt.Errorf("%w: payload size %d exceeds %d", ErrPayloadTooLarge, len(payload), c.maxPayload) }
+	s, ok := c.streams.Get(streamID)
+	if !ok { return 0, fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
+	if err := s.ConsumeSendWindow(int64(len(payload))); err != nil { return 0, err }
+	if err := c.streams.ConsumeConnectionSend(int64(len(payload))); err != nil {
+		_ = s.AddSendWindow(int64(len(payload)))
+		return 0, err
+	}
 	id := c.nextID()
-	return id, c.send(Frame{Type: TypeData, StreamID: streamID, RequestID: id, Payload: payload})
+	if err := c.send(Frame{Type: TypeData, StreamID: streamID, RequestID: id, Payload: payload}); err != nil {
+		_ = s.AddSendWindow(int64(len(payload)))
+		_ = c.streams.AddConnectionSend(int64(len(payload)))
+		return 0, err
+	}
+	return id, nil
 }
 
 func (c *Conn) Receive() (Frame, error) { return c.receive() }
 
 func (c *Conn) Ping() error { id := c.nextID(); return c.send(Frame{Type: TypePing, RequestID: id}) }
-func (c *Conn) CloseProtocol() error { return c.send(Frame{Type: TypeClose, RequestID: c.nextID()}) }
+
+func (c *Conn) CloseProtocol() error {
+	c.stateMu.Lock()
+	c.closed = true
+	c.stateMu.Unlock()
+	c.streams.Close()
+	return c.send(Frame{Type: TypeClose, RequestID: c.nextID()})
+}
+
+// SendWindowUpdate increases the peer's send allowance for a stream.
+func (c *Conn) SendWindowUpdate(streamID uint32, increment uint32) error {
+	if increment == 0 { return errors.New("window increment must be positive") }
+	if streamID == 0 {
+		if err := c.streams.AddConnectionRecv(int64(increment)); err != nil { return err }
+	} else {
+		s, ok := c.streams.Get(streamID)
+		if !ok { return fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
+		if err := s.AddSendWindow(int64(increment)); err != nil { return err }
+	}
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, increment)
+	return c.send(Frame{Type: TypeWindowUpdate, StreamID: streamID, Payload: payload, RequestID: c.nextID()})
+}
+
+// SendGoAway begins graceful shutdown. Existing streams may finish; new local streams are rejected.
+func (c *Conn) SendGoAway(lastStreamID uint32, code ErrorCode) error {
+	c.stateMu.Lock()
+	if c.closed { c.stateMu.Unlock(); return errors.New("connection is closed") }
+	c.goAway = true
+	c.stateMu.Unlock()
+	c.streams.BeginGoAway()
+	payload := make([]byte, 6)
+	binary.BigEndian.PutUint32(payload[:4], lastStreamID)
+	binary.BigEndian.PutUint16(payload[4:], uint16(code))
+	return c.send(Frame{Type: TypeGoAway, StreamID: 0, Payload: payload, RequestID: c.nextID()})
+}
+
+func (c *Conn) handleWindowUpdate(f Frame) error {
+	if len(f.Payload) != 4 { return fmt.Errorf("%w: WINDOW_UPDATE payload must be 4 bytes", ErrInvalidFrame) }
+	inc := binary.BigEndian.Uint32(f.Payload)
+	if inc == 0 { return fmt.Errorf("%w: zero window increment", ErrProtocolState) }
+	if f.StreamID == 0 { return c.streams.AddConnectionSend(int64(inc)) }
+	s, ok := c.streams.Get(f.StreamID)
+	if !ok { return fmt.Errorf("%w: unknown stream %d", ErrProtocolState, f.StreamID) }
+	return s.AddSendWindow(int64(inc))
+}
+
+func (c *Conn) handleGoAway(f Frame) error {
+	if f.StreamID != 0 || len(f.Payload) != 6 { return fmt.Errorf("%w: invalid GOAWAY frame", ErrInvalidFrame) }
+	c.stateMu.Lock()
+	c.goAway = true
+	c.stateMu.Unlock()
+	c.streams.BeginGoAway()
+	return nil
+}
+
+func (c *Conn) handleData(f Frame) error {
+	if f.StreamID == 0 { return fmt.Errorf("%w: DATA cannot use stream zero", ErrProtocolState) }
+	s, ok := c.streams.Get(f.StreamID)
+	if !ok {
+		var err error
+		s, err = c.streams.RegisterRemote(f.StreamID)
+		if err != nil { return fmt.Errorf("%w: %v", ErrProtocolState, err) }
+	}
+	n := int64(len(f.Payload))
+	if err := s.ConsumeRecvWindow(n); err != nil { return err }
+	if err := c.streams.ConsumeConnectionRecv(n); err != nil { return err }
+	if f.Flags&FlagEndStream != 0 { return s.CloseRemote() }
+	return nil
+}
 
 func Listen(addr string, cfg ServerConfig) (net.Listener, error) {
 	cfg.Limits = cfg.Limits.normalize()
@@ -160,10 +268,22 @@ func (c *Conn) Serve() error {
 		switch f.Type {
 		case TypePing:
 			if err := c.send(Frame{Type: TypePong, RequestID: f.RequestID}); err != nil { return err }
+		case TypePong:
+			continue
 		case TypeClose:
+			c.stateMu.Lock(); c.closed = true; c.stateMu.Unlock()
+			c.streams.Close()
 			return nil
 		case TypeData:
+			if err := c.handleData(f); err != nil {
+				_ = c.sendError(ErrProtocolState, err.Error(), f.RequestID)
+				return err
+			}
 			if err := c.send(Frame{Type: TypeData, StreamID: f.StreamID, RequestID: f.RequestID, Payload: f.Payload}); err != nil { return err }
+		case TypeWindowUpdate:
+			if err := c.handleWindowUpdate(f); err != nil { _ = c.sendError(ErrProtocolState, err.Error(), f.RequestID); return err }
+		case TypeGoAway:
+			if err := c.handleGoAway(f); err != nil { _ = c.sendError(ErrInvalidFrame, err.Error(), f.RequestID); return err }
 		case TypeError:
 			return decodeProtocolError(f.Payload)
 		default:
