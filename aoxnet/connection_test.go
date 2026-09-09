@@ -73,3 +73,16 @@ func TestWindowUpdateAndGoAway(t *testing.T) {
 	_ = server.Close()
 	<-done
 }
+
+func TestWindowOverflowRejected(t *testing.T) {
+	stream := NewStream(1, DefaultInitialWindow)
+	if err := stream.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.AddRecvWindow(MaxWindow - stream.RecvWin + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.AddRecvWindow(1); err == nil {
+		t.Fatal("expected receive window overflow")
+	}
+}
