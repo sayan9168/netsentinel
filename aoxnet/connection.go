@@ -68,9 +68,7 @@ func newConnWithLimits(c net.Conn, limits Limits) *Conn {
 func (c *Conn) send(f Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.WriteTimeout > 0 {
-		_ = c.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
-	}
+	if c.WriteTimeout > 0 { _ = c.SetWriteDeadline(time.Now().Add(c.WriteTimeout)) }
 	return f.Encode(c.Conn, c.maxPayload)
 }
 
@@ -176,7 +174,7 @@ func (c *Conn) CloseProtocol() error {
 	return c.send(Frame{Type: TypeClose, RequestID: c.nextID()})
 }
 
-// SendWindowUpdate increases the peer's send allowance for a stream.
+// SendWindowUpdate advertises additional receive capacity to the peer.
 func (c *Conn) SendWindowUpdate(streamID uint32, increment uint32) error {
 	if increment == 0 { return errors.New("window increment must be positive") }
 	if streamID == 0 {
@@ -184,7 +182,7 @@ func (c *Conn) SendWindowUpdate(streamID uint32, increment uint32) error {
 	} else {
 		s, ok := c.streams.Get(streamID)
 		if !ok { return fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
-		if err := s.AddSendWindow(int64(increment)); err != nil { return err }
+		if err := s.AddRecvWindow(int64(increment)); err != nil { return err }
 	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, increment)
