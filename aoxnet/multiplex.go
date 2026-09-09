@@ -23,7 +23,7 @@ type StreamManager struct {
 }
 
 func NewStreamManager(initialWindow int64) *StreamManager {
-	if initialWindow <= 0 { initialWindow = DefaultInitialWindow }
+	if initialWindow <= 0 || initialWindow > MaxWindow { initialWindow = DefaultInitialWindow }
 	return &StreamManager{streams: make(map[uint32]*Stream), nextLocalID: 1, initialWindow: initialWindow, connectionRecv: initialWindow, connectionSend: initialWindow}
 }
 
@@ -45,10 +45,12 @@ func (m *StreamManager) Get(id uint32) (*Stream, bool) {
 	return s, ok
 }
 
+// RegisterRemote accepts only even-numbered stream IDs. Local streams use odd IDs.
 func (m *StreamManager) RegisterRemote(id uint32) (*Stream, error) {
 	if id == 0 { return nil, errors.New("stream ID zero is reserved") }
+	if id%2 != 0 { return nil, errors.New("remote stream ID must be even") }
 	m.mu.Lock(); defer m.mu.Unlock()
-	if m.closed { return nil, errors.New("connection is closed") }
+	if m.closed || m.goAway { return nil, errors.New("connection is shutting down") }
 	if _, exists := m.streams[id]; exists { return nil, errors.New("stream already exists") }
 	s := NewStream(id, m.initialWindow)
 	if err := s.Open(); err != nil { return nil, err }
