@@ -53,16 +53,18 @@ type Conn struct {
 	stateMu sync.RWMutex
 	closed bool
 	goAway bool
+	lastGoAwayStream uint32
+	goAwayCode ErrorCode
 }
 
 func NewConn(c net.Conn, maxPayload uint32) *Conn {
 	limits := Limits{MaxPayload: maxPayload}.normalize()
-	return newConnWithLimits(c, limits)
+	return newConnWithLimits(c, limits, true)
 }
 
-func newConnWithLimits(c net.Conn, limits Limits) *Conn {
+func newConnWithLimits(c net.Conn, limits Limits, localIsClient bool) *Conn {
 	limits = limits.normalize()
-	return &Conn{Conn: c, r: bufio.NewReader(c), maxPayload: limits.MaxPayload, limits: limits, rate: newRateLimiter(limits.MaxFrameRate, limits.RateWindow), streams: NewStreamManager(limits.InitialWindow)}
+	return &Conn{Conn: c, r: bufio.NewReader(c), maxPayload: limits.MaxPayload, limits: limits, rate: newRateLimiter(limits.MaxFrameRate, limits.RateWindow), streams: NewStreamManagerWithRole(limits.InitialWindow, localIsClient)}
 }
 
 func (c *Conn) send(f Frame) error {
@@ -89,6 +91,7 @@ func (c *Conn) sendError(code ErrorCode, message string, requestID uint64) error
 }
 
 func (c *Conn) HandshakeClient(cfg ClientConfig) error {
+	if err := c.streams.SetRole(true); err != nil { return err }
 	if c.limits.HandshakeTimeout > 0 { _ = c.SetDeadline(time.Now().Add(c.limits.HandshakeTimeout)) }
 	defer c.SetDeadline(time.Time{})
 	hello, err := json.Marshal(Hello{Name: cfg.Name, Version: Version, Features: []string{"request-id", "crc32", "ping", "tls-transport", "multiplexing", "flow-control", "goaway"}})
@@ -106,6 +109,7 @@ func (c *Conn) HandshakeClient(cfg ClientConfig) error {
 }
 
 func (c *Conn) HandshakeServer(name string) error {
+	if err := c.streams.SetRole(false); err != nil { return err }
 	if c.limits.HandshakeTimeout > 0 { _ = c.SetDeadline(time.Now().Add(c.limits.HandshakeTimeout)) }
 	defer c.SetDeadline(time.Time{})
 	f, err := c.receive()
@@ -148,9 +152,9 @@ func (c *Conn) Send(streamID uint32, payload []byte) (uint64, error) {
 	if len(payload) > int(c.maxPayload) { return 0, fmt.Errorf("%w: payload size %d exceeds %d", ErrPayloadTooLarge, len(payload), c.maxPayload) }
 	s, ok := c.streams.Get(streamID)
 	if !ok { return 0, fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
-	if err := s.ConsumeSendWindow(int64(len(payload))); err != nil { return 0, err }
-	if err := c.streams.ConsumeConnectionSend(int64(len(payload))); err != nil {
-		_ = s.AddSendWindow(int64(len(payload)))
+	if err := c.streams.ConsumeConnectionSend(int64(len(payload))); err != nil { return 0, err }
+	if err := s.ConsumeSendWindow(int64(len(payload))); err != nil {
+		_ = c.streams.AddConnectionSend(int64(len(payload)))
 		return 0, err
 	}
 	id := c.nextID()
@@ -168,6 +172,7 @@ func (c *Conn) Ping() error { id := c.nextID(); return c.send(Frame{Type: TypePi
 
 func (c *Conn) CloseProtocol() error {
 	c.stateMu.Lock()
+	if c.closed { c.stateMu.Unlock(); return nil }
 	c.closed = true
 	c.stateMu.Unlock()
 	c.streams.Close()
@@ -177,16 +182,14 @@ func (c *Conn) CloseProtocol() error {
 // SendWindowUpdate advertises additional receive capacity to the peer.
 func (c *Conn) SendWindowUpdate(streamID uint32, increment uint32) error {
 	if increment == 0 { return errors.New("window increment must be positive") }
-	if streamID == 0 {
-		if err := c.streams.AddConnectionRecv(int64(increment)); err != nil { return err }
-	} else {
-		s, ok := c.streams.Get(streamID)
-		if !ok { return fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
-		if err := s.AddRecvWindow(int64(increment)); err != nil { return err }
-	}
+	if int64(increment) > MaxWindow { return errors.New("window increment exceeds maximum") }
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, increment)
-	return c.send(Frame{Type: TypeWindowUpdate, StreamID: streamID, Payload: payload, RequestID: c.nextID()})
+	if err := c.send(Frame{Type: TypeWindowUpdate, StreamID: streamID, Payload: payload, RequestID: c.nextID()}); err != nil { return err }
+	if streamID == 0 { return c.streams.AddConnectionRecv(int64(increment)) }
+	s, ok := c.streams.Get(streamID)
+	if !ok { return fmt.Errorf("%w: unknown stream %d", ErrProtocolState, streamID) }
+	return s.AddRecvWindow(int64(increment))
 }
 
 // SendGoAway begins graceful shutdown. Existing streams may finish; new local streams are rejected.
@@ -194,6 +197,8 @@ func (c *Conn) SendGoAway(lastStreamID uint32, code ErrorCode) error {
 	c.stateMu.Lock()
 	if c.closed { c.stateMu.Unlock(); return errors.New("connection is closed") }
 	c.goAway = true
+	c.lastGoAwayStream = lastStreamID
+	c.goAwayCode = code
 	c.stateMu.Unlock()
 	c.streams.BeginGoAway()
 	payload := make([]byte, 6)
@@ -216,6 +221,8 @@ func (c *Conn) handleGoAway(f Frame) error {
 	if f.StreamID != 0 || len(f.Payload) != 6 { return fmt.Errorf("%w: invalid GOAWAY frame", ErrInvalidFrame) }
 	c.stateMu.Lock()
 	c.goAway = true
+	c.lastGoAwayStream = binary.BigEndian.Uint32(f.Payload[:4])
+	c.goAwayCode = ErrorCode(binary.BigEndian.Uint16(f.Payload[4:]))
 	c.stateMu.Unlock()
 	c.streams.BeginGoAway()
 	return nil
@@ -230,8 +237,11 @@ func (c *Conn) handleData(f Frame) error {
 		if err != nil { return fmt.Errorf("%w: %v", ErrProtocolState, err) }
 	}
 	n := int64(len(f.Payload))
-	if err := s.ConsumeRecvWindow(n); err != nil { return err }
 	if err := c.streams.ConsumeConnectionRecv(n); err != nil { return err }
+	if err := s.ConsumeRecvWindow(n); err != nil {
+		_ = c.streams.AddConnectionRecv(n)
+		return err
+	}
 	if f.Flags&FlagEndStream != 0 { return s.CloseRemote() }
 	return nil
 }
@@ -248,7 +258,7 @@ func Dial(addr string, cfg ClientConfig) (*Conn, error) {
 	if err != nil { return nil, err }
 	limits := cfg.Limits
 	if cfg.MaxPayload != 0 { limits.MaxPayload = cfg.MaxPayload }
-	c := newConnWithLimits(nc, limits)
+	c := newConnWithLimits(nc, limits, true)
 	c.ReadTimeout = cfg.ReadTimeout
 	c.WriteTimeout = cfg.WriteTimeout
 	if err := c.HandshakeClient(cfg); err != nil { _ = nc.Close(); return nil, err }
