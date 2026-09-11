@@ -13,6 +13,7 @@ type Limits struct {
 	RateWindow       time.Duration
 	IdleTimeout      time.Duration
 	HandshakeTimeout time.Duration
+	InitialWindow    int64
 }
 
 func (l Limits) normalize() Limits {
@@ -30,6 +31,9 @@ func (l Limits) normalize() Limits {
 	}
 	if l.HandshakeTimeout == 0 {
 		l.HandshakeTimeout = 10 * time.Second
+	}
+	if l.InitialWindow <= 0 || l.InitialWindow > MaxWindow {
+		l.InitialWindow = DefaultInitialWindow
 	}
 	return l
 }
