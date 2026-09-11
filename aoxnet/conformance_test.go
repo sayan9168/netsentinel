@@ -1,6 +1,7 @@
 package aoxnet
 
 import (
+	"bufio"
 	"bytes"
 	"testing"
 )
@@ -16,7 +17,7 @@ func TestFrameConformance(t *testing.T) {
 		if err := in.Encode(&b, DefaultMaxPayload); err != nil {
 			t.Fatal(err)
 		}
-		out, err := Decode(&b, DefaultMaxPayload)
+		out, err := Decode(bufio.NewReader(&b), DefaultMaxPayload)
 		if err != nil {
 			t.Fatal(err)
 		}
