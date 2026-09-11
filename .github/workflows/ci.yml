@@ -8,9 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: aoxnet-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         go: ['1.22.x', '1.23.x']
@@ -27,9 +32,9 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test ./... -count=1
+        run: go test ./... -count=1 -timeout=2m
       - name: Race test
-        run: go test -race ./... -count=1
+        run: go test -race ./... -count=1 -timeout=2m
       - name: Build
         run: go build ./...
       - name: Fuzz smoke test
