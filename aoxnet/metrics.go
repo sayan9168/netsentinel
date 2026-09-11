@@ -29,3 +29,27 @@ func (m *Metrics) StreamClosed() {
 	}
 }
 func (m *Metrics) AddKeepaliveMiss() { atomic.AddUint64(&m.KeepaliveMisses, 1) }
+
+// MetricsSnapshot is an immutable point-in-time view of protocol counters.
+type MetricsSnapshot struct {
+	FramesIn        uint64
+	FramesOut       uint64
+	BytesIn         uint64
+	BytesOut        uint64
+	ProtocolErrors  uint64
+	ActiveStreams   int64
+	KeepaliveMisses uint64
+}
+
+// Snapshot returns atomically loaded metrics suitable for logs, dashboards, or exports.
+func (m *Metrics) Snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		FramesIn:        atomic.LoadUint64(&m.FramesIn),
+		FramesOut:       atomic.LoadUint64(&m.FramesOut),
+		BytesIn:         atomic.LoadUint64(&m.BytesIn),
+		BytesOut:        atomic.LoadUint64(&m.BytesOut),
+		ProtocolErrors:  atomic.LoadUint64(&m.ProtocolErrors),
+		ActiveStreams:   atomic.LoadInt64(&m.ActiveStreams),
+		KeepaliveMisses: atomic.LoadUint64(&m.KeepaliveMisses),
+	}
+}
