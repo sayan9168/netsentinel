@@ -86,7 +86,7 @@ func TestWindowOverflowRejected(t *testing.T) {
 	if err := stream.Open(); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.AddRecvWindow(MaxWindow - stream.RecvWin + 1); err != nil {
+	if err := stream.AddRecvWindow(MaxWindow - stream.RecvWin); err != nil {
 		t.Fatal(err)
 	}
 	if err := stream.AddRecvWindow(1); err == nil {
