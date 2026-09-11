@@ -16,19 +16,29 @@ type Limits struct {
 }
 
 func (l Limits) normalize() Limits {
-	if l.MaxPayload == 0 { l.MaxPayload = DefaultMaxPayload }
-	if l.MaxFrameRate == 0 { l.MaxFrameRate = 1000 }
-	if l.RateWindow == 0 { l.RateWindow = time.Second }
-	if l.IdleTimeout == 0 { l.IdleTimeout = 2 * time.Minute }
-	if l.HandshakeTimeout == 0 { l.HandshakeTimeout = 10 * time.Second }
+	if l.MaxPayload == 0 {
+		l.MaxPayload = DefaultMaxPayload
+	}
+	if l.MaxFrameRate == 0 {
+		l.MaxFrameRate = 1000
+	}
+	if l.RateWindow == 0 {
+		l.RateWindow = time.Second
+	}
+	if l.IdleTimeout == 0 {
+		l.IdleTimeout = 2 * time.Minute
+	}
+	if l.HandshakeTimeout == 0 {
+		l.HandshakeTimeout = 10 * time.Second
+	}
 	return l
 }
 
 type rateLimiter struct {
-	mu sync.Mutex
-	start time.Time
-	count uint32
-	limit uint32
+	mu     sync.Mutex
+	start  time.Time
+	count  uint32
+	limit  uint32
 	window time.Duration
 }
 
@@ -44,7 +54,9 @@ func (r *rateLimiter) allow() error {
 		r.start = now
 		r.count = 0
 	}
-	if r.count >= r.limit { return fmt.Errorf("%w: frame rate exceeded", ErrRateLimited) }
+	if r.count >= r.limit {
+		return fmt.Errorf("%w: frame rate exceeded", ErrRateLimited)
+	}
 	r.count++
 	return nil
 }
