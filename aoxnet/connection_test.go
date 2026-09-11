@@ -60,6 +60,13 @@ func TestWindowUpdateAndGoAway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := client.Send(stream.ID, []byte("seed")); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := client.Receive(); err != nil {
+		t.Fatal(err)
+	}
 	if err := client.SendWindowUpdate(stream.ID, 1024); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +86,7 @@ func TestWindowOverflowRejected(t *testing.T) {
 	if err := stream.Open(); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.AddRecvWindow(MaxWindow - stream.RecvWin + 1); err != nil {
+	if err := stream.AddRecvWindow(MaxWindow - stream.RecvWin); err != nil {
 		t.Fatal(err)
 	}
 	if err := stream.AddRecvWindow(1); err == nil {
